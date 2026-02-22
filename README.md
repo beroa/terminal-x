@@ -7,9 +7,15 @@ This is a CLI tool to convert natural language to bash commands. Under the hood,
 
 ## Installation
 ```bash
-$ sudo yarn global add terminal-x
+$ git clone https://github.com/davidfant/terminal-x.git
+$ cd terminal-x
+$ npm install
+$ npm link
 $ x init
 ```
+
+`x init` prompts you to enter your own OpenAI API key and stores it at `~/.x`.
+You can also provide the key via the `OPENAI_TOKEN` environment variable.
 
 ## Examples
 ```bash

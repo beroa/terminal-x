@@ -19,17 +19,30 @@ function getApiKey() {
   }
 
   if (fs.existsSync(PATH_TO_API_KEY_FILE)) {
-    return fs.readFileSync(PATH_TO_API_KEY_FILE, 'utf8');
+    return fs.readFileSync(PATH_TO_API_KEY_FILE, 'utf8').trim();
   }
 
   return undefined;
 }
 
 async function fetchAndStoreApiKey() {
-  const spinner = ora('Initializing...').start();
-  const apiKey = await request('https://fant.io/x');
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  const apiKey = await new Promise((resolve) => {
+    rl.question('Enter your OpenAI API key: ', (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
+
+  if (!apiKey) {
+    throw new Error('No API key provided');
+  }
+
   fs.writeFileSync(PATH_TO_API_KEY_FILE, apiKey, 'utf8');
-  spinner.succeed('Initialized');
+  console.log('API key saved');
 }
 
 async function getSuggestion(prompt) {
@@ -127,6 +140,9 @@ if (!query) {
 } else if (query === 'init') {
   await fetchAndStoreApiKey();
 } else {
-  if (!getApiKey()) await fetchAndStoreApiKey();
+  if (!getApiKey()) {
+    console.log('No API key found. Run `x init` or set OPENAI_TOKEN.');
+    process.exit(1);
+  }
   await suggest();
 }
