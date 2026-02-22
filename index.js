@@ -3,18 +3,30 @@ import fs from 'fs';
 import os from 'os';
 import ora from 'ora';
 import path from 'path';
-import request from 'request-promise';
 import chalk from 'chalk';
 import readline from 'readline';
 import ShellJS from 'shelljs';
+import OpenAI from 'openai';
 
 const PATH_TO_API_KEY_FILE = path.join(os.homedir(), '.x');
+const FIXED_MODEL = 'gpt-5-mini';
+const MAX_ALTERNATIVES = 3;
+const SYSTEM_PROMPT = [
+  'You convert user requests into one safe shell command.',
+  'Respond with exactly one bash command and no explanation.',
+  'Do not include markdown, comments, backticks, or a leading "$".',
+  'If a command is unsafe or ambiguous, prefer a non-destructive command.',
+].join(' ');
 
 const args = process.argv.slice(2);
 const query = args.join(' ');
 
 function getApiKey() {
-  if (!!process.env.OPENAI_TOKEN) {
+  if (process.env.OPENAI_API_KEY) {
+    return process.env.OPENAI_API_KEY;
+  }
+
+  if (process.env.OPENAI_TOKEN) {
     return process.env.OPENAI_TOKEN;
   }
 
@@ -45,59 +57,146 @@ async function fetchAndStoreApiKey() {
   console.log('API key saved');
 }
 
-async function getSuggestion(prompt) {
-  const response = await request({
-    url: 'https://api.openai.com/v1/engines/davinci-codex/completions',
-    method: 'POST',
-    json: true,
-    headers: {
-      'Authorization': `Bearer ${getApiKey()}`,
-    },
-    body: {
-      prompt,
-      temperature: 0,
-      max_tokens: 300,
-      top_p: 1,
-      frequency_penalty: 0,
-      presence_penalty: 0,
-      stop: ['#']
-    },
-  });
-
-  if (!response || !response.choices || !response.choices.length) {
-    throw new Error('No suggestion found');
+function extractOutputText(response) {
+  if (typeof response?.output_text === 'string' && response.output_text.trim()) {
+    return response.output_text;
   }
 
-  const suggestion = response.choices[0].text.trim().replace(/^!/, '');
+  if (!Array.isArray(response?.output)) {
+    return '';
+  }
+
+  const chunks = [];
+  for (const item of response.output) {
+    if (!Array.isArray(item?.content)) {
+      continue;
+    }
+    for (const content of item.content) {
+      if (typeof content?.text === 'string') {
+        chunks.push(content.text);
+      }
+    }
+  }
+  return chunks.join('\n').trim();
+}
+
+function sanitizeSuggestion(text) {
+  let cleaned = (text || '').trim();
+  if (!cleaned) {
+    return '';
+  }
+
+  const fencedMatch = cleaned.match(/```(?:bash|sh)?\s*([\s\S]*?)```/i);
+  if (fencedMatch) {
+    cleaned = fencedMatch[1].trim();
+  }
+
+  cleaned = cleaned.replace(/^`+|`+$/g, '').trim();
+  cleaned = cleaned.replace(/^command:\s*/i, '').trim();
+  cleaned = cleaned.replace(/^\$\s*/, '').trim();
+
+  const line = cleaned
+    .split('\n')
+    .map((part) => part.trim())
+    .find((part) => part.length > 0);
+
+  return line ? line.replace(/^\$\s*/, '').trim() : '';
+}
+
+function buildPrompt(userQuery, rejectedSuggestions) {
+  if (!rejectedSuggestions.length) {
+    return userQuery;
+  }
+
+  const rejectedText = rejectedSuggestions
+    .map((suggestion, idx) => `${idx + 1}. ${suggestion}`)
+    .join('\n');
+
+  return [
+    `User request: ${userQuery}`,
+    'Prior suggestions to avoid:',
+    rejectedText,
+    'Return a different command that still satisfies the request.',
+  ].join('\n\n');
+}
+
+async function getSuggestion(client, userQuery, rejectedSuggestions) {
+  const request = {
+    model: FIXED_MODEL,
+    instructions: SYSTEM_PROMPT,
+    input: buildPrompt(userQuery, rejectedSuggestions),
+    reasoning: { effort: 'minimal' },
+    max_output_tokens: 200,
+  };
+
+  let response = await client.responses.create(request);
+  let suggestion = sanitizeSuggestion(extractOutputText(response));
+
+  // Some reasoning-capable models can consume output tokens before emitting text.
+  if (!suggestion && response?.incomplete_details?.reason === 'max_output_tokens') {
+    response = await client.responses.create({
+      ...request,
+      max_output_tokens: 500,
+    });
+    suggestion = sanitizeSuggestion(extractOutputText(response));
+  }
+
   if (!suggestion) {
     throw new Error('No suggestion found');
   }
 
-  return suggestion;
+  return suggestion.replace(/^!/, '').trim();
 }
 
 async function suggest() {
-  readline.emitKeypressEvents(process.stdin);
-  process.stdin.setRawMode(true);
-  process.stdin.on('keypress', (_chunk, key) => {
-    if (key.ctrl && key.name === 'c') {
-      process.exit();
-    }
-  });
+  const client = new OpenAI({ apiKey: getApiKey() });
+  const rejectedSuggestions = [];
+  const supportsRawMode = Boolean(process.stdin.isTTY && process.stdin.setRawMode);
+  let interrupted = false;
+  let keypressListener;
+  const spinner = ora(query);
+  if (supportsRawMode) {
+    spinner.start();
+  }
 
-  let prompt = `# Bash\n# ${query}\n`;
-  let attempt = 0;
-  const spinner = ora(query).start();
+  const cleanup = () => {
+    if (keypressListener) {
+      process.stdin.removeListener('keypress', keypressListener);
+      keypressListener = undefined;
+    }
+    if (supportsRawMode) {
+      process.stdin.setRawMode(false);
+    }
+  };
+
+  readline.emitKeypressEvents(process.stdin);
+  if (supportsRawMode) {
+    process.stdin.setRawMode(true);
+    keypressListener = (_chunk, key) => {
+      if (key?.ctrl && key.name === 'c') {
+        interrupted = true;
+        cleanup();
+        process.exit(130);
+      }
+    };
+    process.stdin.on('keypress', keypressListener);
+  }
+
   try {
     while (true) {
-      const suggestion = await getSuggestion(prompt);
+      const suggestion = await getSuggestion(client, query, rejectedSuggestions);
+
+      if (!supportsRawMode) {
+        console.log(chalk.green('$ ') + chalk.bold(suggestion));
+        return;
+      }
 
       spinner.color = 'green';
       spinner.text = `${chalk.bold(suggestion)}\n\nenter → run command\nspace → new suggestion`;
       spinner.spinner = { frames: ['$'] };
 
       const shouldExecuteCommand = await new Promise((resolve) => {
-        function listener(_chunk, key) {
+        const listener = (_chunk, key) => {
           switch (key.name) {
             case 'return':
               process.stdin.removeListener('keypress', listener);
@@ -108,7 +207,7 @@ async function suggest() {
               resolve(false);
               break;
           }
-        }
+        };
 
         process.stdin.on('keypress', listener);
       });
@@ -118,19 +217,30 @@ async function suggest() {
         console.log(chalk.green('$ ') + chalk.bold(suggestion));
 
         ShellJS.exec(suggestion, {async: true});
+        return;
       } else {
-        attempt++;
-        if (attempt === 3) break;
+        rejectedSuggestions.push(suggestion);
+        if (rejectedSuggestions.length >= MAX_ALTERNATIVES) {
+          break;
+        }
         spinner.color = 'cyan';
         spinner.text = query;
         spinner.spinner = 'dots';
-        prompt += `${suggestion}\n\n# Same command, but differently formatted\n`;
       }
     }
 
     throw new Error('No suggestion found');
   } catch (error) {
-    spinner.fail(error.toString());
+    const message = error?.message || String(error);
+    if (supportsRawMode) {
+      spinner.fail(message);
+    } else {
+      console.error(message);
+    }
+  } finally {
+    if (!interrupted) {
+      cleanup();
+    }
   }
 }
 
@@ -141,7 +251,7 @@ if (!query) {
   await fetchAndStoreApiKey();
 } else {
   if (!getApiKey()) {
-    console.log('No API key found. Run `x init` or set OPENAI_TOKEN.');
+    console.log('No API key found. Run `x init` or set OPENAI_API_KEY (or OPENAI_TOKEN).');
     process.exit(1);
   }
   await suggest();
