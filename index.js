@@ -58,26 +58,17 @@ async function fetchAndStoreApiKey() {
 }
 
 function extractOutputText(response) {
-  if (typeof response?.output_text === 'string' && response.output_text.trim()) {
-    return response.output_text;
+  const directText = response?.output_text;
+  if (typeof directText === 'string' && directText.trim()) {
+    return directText;
   }
 
-  if (!Array.isArray(response?.output)) {
-    return '';
-  }
-
-  const chunks = [];
-  for (const item of response.output) {
-    if (!Array.isArray(item?.content)) {
-      continue;
-    }
-    for (const content of item.content) {
-      if (typeof content?.text === 'string') {
-        chunks.push(content.text);
-      }
-    }
-  }
-  return chunks.join('\n').trim();
+  return (response?.output ?? [])
+    .flatMap((item) => item?.content ?? [])
+    .map((content) => (typeof content?.text === 'string' ? content.text : ''))
+    .filter(Boolean)
+    .join('\n')
+    .trim();
 }
 
 function sanitizeSuggestion(text) {
@@ -120,24 +111,41 @@ function buildPrompt(userQuery, rejectedSuggestions) {
   ].join('\n\n');
 }
 
-async function getSuggestion(client, userQuery, rejectedSuggestions) {
-  const request = {
+function createSuggestionRequest(userQuery, rejectedSuggestions, maxOutputTokens) {
+  return {
     model: FIXED_MODEL,
     instructions: SYSTEM_PROMPT,
     input: buildPrompt(userQuery, rejectedSuggestions),
     reasoning: { effort: 'minimal' },
-    max_output_tokens: 200,
+    max_output_tokens: maxOutputTokens,
   };
+}
 
+function waitForAction() {
+  return new Promise((resolve) => {
+    const listener = (_chunk, key) => {
+      if (key?.name === 'return') {
+        process.stdin.removeListener('keypress', listener);
+        resolve(true);
+      } else if (key?.name === 'space') {
+        process.stdin.removeListener('keypress', listener);
+        resolve(false);
+      }
+    };
+
+    process.stdin.on('keypress', listener);
+  });
+}
+
+async function getSuggestion(client, userQuery, rejectedSuggestions) {
+  let request = createSuggestionRequest(userQuery, rejectedSuggestions, 200);
   let response = await client.responses.create(request);
   let suggestion = sanitizeSuggestion(extractOutputText(response));
 
   // Some reasoning-capable models can consume output tokens before emitting text.
   if (!suggestion && response?.incomplete_details?.reason === 'max_output_tokens') {
-    response = await client.responses.create({
-      ...request,
-      max_output_tokens: 500,
-    });
+    request = createSuggestionRequest(userQuery, rejectedSuggestions, 500);
+    response = await client.responses.create(request);
     suggestion = sanitizeSuggestion(extractOutputText(response));
   }
 
@@ -151,11 +159,11 @@ async function getSuggestion(client, userQuery, rejectedSuggestions) {
 async function suggest() {
   const client = new OpenAI({ apiKey: getApiKey() });
   const rejectedSuggestions = [];
-  const supportsRawMode = Boolean(process.stdin.isTTY && process.stdin.setRawMode);
-  let interrupted = false;
+  const interactive = Boolean(process.stdin.isTTY && process.stdin.setRawMode);
+  let ctrlCPressed = false;
   let keypressListener;
   const spinner = ora(query);
-  if (supportsRawMode) {
+  if (interactive) {
     spinner.start();
   }
 
@@ -164,17 +172,17 @@ async function suggest() {
       process.stdin.removeListener('keypress', keypressListener);
       keypressListener = undefined;
     }
-    if (supportsRawMode) {
+    if (interactive) {
       process.stdin.setRawMode(false);
     }
   };
 
-  readline.emitKeypressEvents(process.stdin);
-  if (supportsRawMode) {
+  if (interactive) {
+    readline.emitKeypressEvents(process.stdin);
     process.stdin.setRawMode(true);
     keypressListener = (_chunk, key) => {
       if (key?.ctrl && key.name === 'c') {
-        interrupted = true;
+        ctrlCPressed = true;
         cleanup();
         process.exit(130);
       }
@@ -183,10 +191,10 @@ async function suggest() {
   }
 
   try {
-    while (true) {
+    for (let attempt = 0; attempt < MAX_ALTERNATIVES; attempt += 1) {
       const suggestion = await getSuggestion(client, query, rejectedSuggestions);
 
-      if (!supportsRawMode) {
+      if (!interactive) {
         console.log(chalk.green('$ ') + chalk.bold(suggestion));
         return;
       }
@@ -195,22 +203,7 @@ async function suggest() {
       spinner.text = `${chalk.bold(suggestion)}\n\nenter → run command\nspace → new suggestion`;
       spinner.spinner = { frames: ['$'] };
 
-      const shouldExecuteCommand = await new Promise((resolve) => {
-        const listener = (_chunk, key) => {
-          switch (key.name) {
-            case 'return':
-              process.stdin.removeListener('keypress', listener);
-              resolve(true);
-              break;
-            case 'space':
-              process.stdin.removeListener('keypress', listener);
-              resolve(false);
-              break;
-          }
-        };
-
-        process.stdin.on('keypress', listener);
-      });
+      const shouldExecuteCommand = await waitForAction();
 
       if (shouldExecuteCommand) {
         spinner.stop();
@@ -218,27 +211,24 @@ async function suggest() {
 
         ShellJS.exec(suggestion, {async: true});
         return;
-      } else {
-        rejectedSuggestions.push(suggestion);
-        if (rejectedSuggestions.length >= MAX_ALTERNATIVES) {
-          break;
-        }
-        spinner.color = 'cyan';
-        spinner.text = query;
-        spinner.spinner = 'dots';
       }
+
+      rejectedSuggestions.push(suggestion);
+      spinner.color = 'cyan';
+      spinner.text = query;
+      spinner.spinner = 'dots';
     }
 
     throw new Error('No suggestion found');
   } catch (error) {
     const message = error?.message || String(error);
-    if (supportsRawMode) {
+    if (interactive) {
       spinner.fail(message);
     } else {
       console.error(message);
     }
   } finally {
-    if (!interrupted) {
+    if (!ctrlCPressed) {
       cleanup();
     }
   }
